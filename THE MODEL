@@ -1,0 +1,470 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from river import compose, preprocessing, drift, metrics
+from river.forest import ARFClassifier
+from river.linear_model import LinearRegression
+from river.optim import SGD
+from river.preprocessing import OneHotEncoder, StandardScaler
+from river import stats
+import matplotlib.pyplot as plt
+import json
+from collections import defaultdict
+from river.drift import ADWIN
+from river.feature_extraction import RBFSampler
+from river.utils import Rolling
+from sklearn.metrics import confusion_matrix
+
+# data fetching with retries and validation
+tickers = {
+    'AAPL': 'stock',
+    'SPY': 'ETF'
+}
+
+def fetch_data(tickers, period='2y', interval='1d'):
+    attempts = 0
+    max_attempts = 3
+    df = None
+    
+    while attempts < max_attempts:
+        try:
+            df = yf.download(
+                list(tickers.keys()), 
+                period=period, 
+                interval=interval,
+                group_by='ticker',
+                auto_adjust=True,
+                threads=True
+            )
+            if not df.empty:
+                break
+        except Exception as e:
+            print(f"Attempt {attempts+1} failed: {e}")
+        attempts += 1
+        
+    if df is None or df.empty:
+        raise ValueError("Failed to fetch data after multiple attempts")
+    
+    # multi-index DataFrame
+    dfs = []
+    for ticker in tickers:
+        ticker_df = df[ticker].copy()
+        ticker_df['Ticker'] = ticker
+        dfs.append(ticker_df)
+    
+    df = pd.concat(dfs).reset_index()
+    df.rename(columns={'Date': 'date'}, inplace=True)
+    
+    #rename the columns
+    keep_cols = ['date', 'Ticker', 'Open', 'High', 'Low', 'Close', 'Volume']
+    df = df[keep_cols]
+    df.columns = ['Date', 'Ticker', 'Open', 'High', 'Low', 'Close', 'Volume']
+    
+    # add asset type
+    df['AssetType'] = df['Ticker'].map(tickers)
+    
+    # validation
+    df = df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'])
+    df = df[(df[['Open', 'High', 'Low', 'Close']] > 0).all(axis=1)]
+    df = df[(df['High'] >= df[['Low', 'Open', 'Close']].max(axis=1)) & 
+            (df['Low'] <= df[['Open', 'Close']].min(axis=1))]
+    
+    #sort and reset index
+    df = df.sort_values(by=['Ticker', 'Date'])
+    df = df.reset_index(drop=True)
+    
+    return df
+
+# feature engineering with technical indicators
+def engineer_features_and_targets(df):
+    df = df.copy()
+    grouped = df.groupby('Ticker')
+    
+    # return calculation
+    df['Return'] = grouped['Close'].transform(lambda x: x.pct_change())
+    df['LogReturn'] = grouped['Close'].transform(lambda x: np.log(x / x.shift(1)))
+    
+    #target creation
+    df['NextClose'] = grouped['Close'].shift(-1)
+    df['Direction'] = (df['NextClose'] > df['Close']).astype(int)
+    
+    # volatility features rolling sd of log returns
+    df['RollingVol'] = grouped['LogReturn'].transform(lambda x: x.rolling(window=20, min_periods=15).std())
+    
+    # Volatility regime  binary feature indCating if volatitly is above 70th percentiley rolling volatility
+    def vol_regime(series):
+        rolling_vol = series.rolling(window=20, min_periods=15).std()
+        quantile_70 = rolling_vol.rolling(window=60, min_periods=30).quantile(0.7).shift(1)
+        return (rolling_vol > quantile_70).astype(int)
+    
+    df['VolatilityRegime'] = grouped['LogReturn'].transform(vol_regime)
+    
+    #Time features
+    df['DayOfWeek'] = df['Date'].dt.dayofweek
+    df['Month'] = df['Date'].dt.month
+    df['DayOfMonth'] = df['Date'].dt.day
+    
+    # Technical indicators
+    # RSI
+    def calculate_rsi(series, window=14):
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=window, min_periods=window).mean()
+        avg_loss = loss.rolling(window=window, min_periods=window).mean()
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    
+    df['RSI'] = grouped['Close'].transform(calculate_rsi)
+    
+    # MACD
+    def calculate_macd(series, slow=26, fast=12, signal=9):
+        ema_fast = series.ewm(span=fast, adjust=False).mean()
+        ema_slow = series.ewm(span=slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal, adjust=False).mean()
+        return macd, signal_line
+
+    macd_vals = np.full(len(df), np.nan)
+    macd_signal_vals = np.full(len(df), np.nan)
+    for ticker, group in grouped:
+        macd, signal = calculate_macd(group['Close'])
+        idx = group.index
+        macd_vals[idx] = macd
+        macd_signal_vals[idx] = signal
+    df['MACD'] = macd_vals
+    df['MACD_Signal'] = macd_signal_vals
+
+    # bollingnger Bands middle, upper and lower bands widht 
+    def calculate_bollinger(series, window=20):
+        sma = series.rolling(window=window).mean()
+        std = series.rolling(window=window).std()
+        upper = sma + 2*std
+        lower = sma - 2*std
+        return sma, upper, lower
+
+    bb_mid_vals = np.full(len(df), np.nan)
+    bb_upper_vals = np.full(len(df), np.nan)
+    bb_lower_vals = np.full(len(df), np.nan)
+    for ticker, group in grouped:
+        sma, upper, lower = calculate_bollinger(group['Close'])
+        idx = group.index
+        bb_mid_vals[idx] = sma
+        bb_upper_vals[idx] = upper
+        bb_lower_vals[idx] = lower
+    df['BB_Mid'] = bb_mid_vals
+    df['BB_Upper'] = bb_upper_vals
+    df['BB_Lower'] = bb_lower_vals
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    
+    #volume features rollling mean, ration to mean and %change
+    df['VolumeMA'] = grouped['Volume'].transform(lambda x: x.rolling(window=20, min_periods=15).mean())
+    df['VolumeRatio'] = df['Volume'] / df['VolumeMA']
+    df['VolumeChange'] = grouped['Volume'].transform(lambda x: x.pct_change())
+    
+    # drop missing values
+    df = df.dropna()
+    
+    return df
+
+# pipeline setup stabbdadize numerical features and hot encode categorical  and then use
+# use transromwer to combine them
+feature_cols = [
+    'LogReturn', 'RollingVol', 'VolatilityRegime', 'DayOfWeek', 'Month', 'DayOfMonth',
+    'RSI', 'MACD', 'MACD_Signal', 'BB_Width', 'VolumeRatio', 'VolumeChange', 'AssetType'
+]
+
+preproc = compose.TransformerUnion(
+    compose.SelectType((float,)) | preprocessing.StandardScaler(),
+    compose.SelectType((object,)) | OneHotEncoder()
+)
+
+#volatility model linear regersiion with SDG optimizer
+vol_model = LinearRegression(
+    optimizer=SGD(0.005),
+    intercept_lr=0.05,
+    l2=0.01
+)
+
+#  direction model - using Adaptive Random Forest
+dir_model = ARFClassifier(
+    n_models=15,
+    drift_detector=ADWIN(),
+    warning_detector=ADWIN(),
+    seed=42,
+    lambda_value=6  
+)
+
+#volune pioeline
+vol_pipeline = preproc | vol_model
+dir_pipeline = preproc | dir_model
+
+#drift detection ADptive Windowing 
+vol_drift_detector = ADWIN()
+dir_drift_detector = ADWIN()
+
+# metrics tracking
+metrics_dict = {
+    'vol_mae': metrics.MAE(),
+    'vol_rmse': metrics.RMSE(),
+    'vol_r2': metrics.R2(),
+    
+    'dir_accuracy': metrics.Accuracy(),
+    'dir_precision': metrics.Precision(),
+    'dir_recall': metrics.Recall(),
+    'dir_f1': metrics.F1(),
+    'dir_roc_auc': metrics.ROCAUC(),
+    'dir_geometric_mean': metrics.GeometricMean()
+}
+
+# rolling metrics 4 recent performance
+rolling_window = 90
+rolling_metrics = {
+    'vol_mae': Rolling(metrics.MAE(), rolling_window),
+    'dir_accuracy': Rolling(stats.Mean(), rolling_window),
+    'dir_f1': Rolling(metrics.F1(), rolling_window)
+}
+# A structured storage of specific, temporally ordered experiences usually including perceptual input, action taken, and resulting outcome.
+# episodic memory with experience replay stores recent samples for each itcker  
+class EnhancedEpisodicMemory:
+    def __init__(self, max_size=2000, replay_size=50):
+        self.max_size = max_size
+        self.memories = defaultdict(list)
+        self.replay_size = replay_size
+        
+    def add(self, ticker, x, y):
+        if len(self.memories[ticker]) >= self.max_size:
+            self.memories[ticker].pop(0)
+        self.memories[ticker].append((x, y))
+        
+    def sample(self, ticker, n=None):
+        mem = self.memories.get(ticker, [])
+        return mem if n is None else mem[-n:]
+    
+    def replay(self, model, ticker):
+        samples = self.sample(ticker, self.replay_size)
+        for x, y in samples:
+            model.learn_one(x, y)
+
+memory_vol = EnhancedEpisodicMemory(replay_size=100)
+memory_dir = EnhancedEpisodicMemory(replay_size=100)
+
+# threshold optimization for direction prediction adjuust the thershhold based on the F1 socre
+# after each 50 samples it dtured a difrent threshold and picks the one woth the bst F1 socre
+# ut uses current threshold to make a bunary prediction
+class DirectionThresholdOptimizer:
+    def __init__(self, window_size=200, step=0.05):
+        self.window_size = window_size
+        self.step = step
+        self.history = []
+        self.threshold = 0.5
+        self.counter = 0
+        
+    def update(self, y_true, y_prob):
+        self.history.append((int(y_true), y_prob))
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+        
+        # Update threshold every 50 samples
+        self.counter += 1
+        if self.counter % 50 == 0 and self.history:
+            best_threshold = 0.5
+            best_f1 = 0
+            
+            for threshold in np.arange(0.3, 0.71, self.step):
+                f1_metric = metrics.F1()
+                for true, prob in self.history:
+                    pred = 1 if prob >= threshold else 0
+                    f1_metric.update(bool(true), bool(pred))
+                f1_score = f1_metric.get()
+                if f1_score > best_f1:
+                    best_f1 = f1_score
+                    best_threshold = threshold
+            
+            if best_f1 > 0:
+                self.threshold = best_threshold
+                print(f"Updated direction threshold to {best_threshold:.2f} (F1: {best_f1:.4f})")
+    
+    def predict(self, prob):
+        return 1 if prob >= self.threshold else 0
+
+# Main processing function
+def main():
+    # Fetch and prepare data
+    print("Fetching data...")
+    data = fetch_data(tickers, period='3y') 
+    print("Engineering features...")
+    data = engineer_features_and_targets(data)
+    
+    print(f"Loaded {len(data)} samples")
+    print(f"Class distribution:\n{data['Direction'].value_counts(normalize=True)}")
+    
+    #iitialize threshold optimizer
+    threshold_optimizer = DirectionThresholdOptimizer()
+    
+    #tack last predictions for drift adaptation
+    last_vol_pred = {}
+    last_dir_pred = {}
+    
+    #rsults storage
+    results = []
+    
+    print("\nStarting online training...")
+    print("Date\t\tTicker\tVolTrue\tVolPred\tDirTrue\tDirPred\tVolDrift\tDirDrift")
+    
+    for idx, row in enumerate(data.itertuples(index=False, name='Row')):
+        ticker = getattr(row, 'Ticker')
+        date = getattr(row, 'Date')
+        # esure all feature keys are strings to avoid type conflicts
+        x = {str(col): getattr(row, col) for col in feature_cols}
+        
+        # Get targets
+        vol_true = getattr(row, 'RollingVol')
+        dir_true = int(getattr(row, 'Direction'))
+        
+        # Make predictions
+        vol_pred = vol_pipeline.predict_one(x) or 0.0
+        dir_proba = dir_pipeline.predict_proba_one(x).get(1, 0.0)
+        dir_pred = int(threshold_optimizer.predict(dir_proba))
+        
+        # Store predictions
+        last_vol_pred[ticker] = vol_pred
+        last_dir_pred[ticker] = dir_pred
+        
+        # Update metrics
+        metrics_dict['vol_mae'].update(vol_true, vol_pred)
+        metrics_dict['vol_rmse'].update(vol_true, vol_pred)
+        metrics_dict['vol_r2'].update(vol_true, vol_pred)
+        
+        metrics_dict['dir_accuracy'].update(dir_true, dir_pred)
+        metrics_dict['dir_precision'].update(dir_true, dir_pred)
+        metrics_dict['dir_recall'].update(dir_true, dir_pred)
+        metrics_dict['dir_f1'].update(bool(dir_true), bool(dir_pred))
+        metrics_dict['dir_roc_auc'].update(dir_true, dir_proba)
+        metrics_dict['dir_geometric_mean'].update(dir_true, dir_pred)
+        
+        # Update rolling metrics
+        rolling_metrics['vol_mae'].update(vol_true, vol_pred)
+        rolling_metrics['dir_accuracy'].update(dir_true == dir_pred)
+        rolling_metrics['dir_f1'].update(dir_true, dir_pred)
+        
+        # Update threshold optimizer
+        threshold_optimizer.update(dir_true, dir_proba)
+        
+        # Detect drift
+        vol_error = float(abs(vol_true - vol_pred))
+        dir_error = int(dir_true != dir_pred)
+
+        vol_drift_detector.update(vol_error)
+        vol_drift = vol_drift_detector.drift_detected
+        dir_drift_detector.update(dir_error)
+        dir_drift = dir_drift_detector.drift_detected
+        
+        # Handle drift - experience replay
+        if vol_drift:
+            print(f"Volatility drift detected in {ticker} on {date}")
+            memory_vol.replay(vol_pipeline, ticker)
+            
+        if dir_drift:
+            print(f"Direction drift detected in {ticker} on {date}")
+            memory_dir.replay(dir_pipeline, ticker)
+        
+        # Update memory
+        memory_vol.add(ticker, x, vol_true)
+        memory_dir.add(ticker, x, dir_true)
+        
+        # Learn from current sample
+        vol_pipeline.learn_one(x, vol_true)
+        dir_pipeline.learn_one(x, dir_true)
+        
+        # Store results
+        results.append({
+            'Date': date,
+            'Ticker': ticker,
+            'VolatilityTrue': vol_true,
+            'VolatilityPred': vol_pred,
+            'DirectionTrue': dir_true,
+            'DirectionPred': dir_pred,
+            'DirectionProbUp': dir_proba,
+            'VolatilityDrift': vol_drift,
+            'DirectionDrift': dir_drift,
+            'DirectionThreshold': threshold_optimizer.threshold
+        })
+        
+        # Print progress
+        if idx % 100 == 0 or idx == len(data)-1:
+            print(f"{date}\t{ticker}\t{vol_true:.4f}\t{vol_pred:.4f}\t{dir_true}\t{dir_pred}\t{vol_drift}\t{dir_drift}")
+    
+    # Save results
+    results_df = pd.DataFrame(results)
+    results_df.to_csv('enhanced_trading_model_results.csv', index=False)
+
+    # Confusion matrix for direction predictions
+    y_true = results_df['DirectionTrue']
+    y_pred = results_df['DirectionPred']
+    cm = confusion_matrix(y_true, y_pred)
+    print("\nConfusion Matrix (Direction Prediction):")
+    print(cm)
+    
+    # Final metrics
+    print("\nFinal Metrics:")
+    for name, metric in metrics_dict.items():
+        print(f"{name}: {metric.get():.4f}")
+    
+    print("\nRolling Metrics:")
+    for name, metric in rolling_metrics.items():
+        print(f"{name}: {metric.get():.4f}")
+    
+    # visualization
+    for ticker in tickers:
+        ticker_results = results_df[results_df['Ticker'] == ticker]
+        
+        plt.figure(figsize=(15, 12))
+        
+        # Volatility prediction
+        plt.subplot(3, 1, 1)
+        plt.plot(ticker_results['Date'], ticker_results['VolatilityTrue'], 'b-', label='True Volatility')
+        plt.plot(ticker_results['Date'], ticker_results['VolatilityPred'], 'r-', label='Predicted Volatility')
+        plt.title(f'{ticker} Volatility Prediction')
+        plt.legend()
+        plt.grid(True)
+        
+        # Direction prediction
+        plt.subplot(3, 1, 2)
+        plt.plot(ticker_results['Date'], ticker_results['DirectionTrue'].astype(float), 'bo', markersize=3, label='True Direction')
+        plt.plot(ticker_results['Date'], ticker_results['DirectionProbUp'], 'r-', label='Predicted Probability')
+        plt.plot(ticker_results['Date'], np.full(len(ticker_results), threshold_optimizer.threshold), 'g--', label='Decision Threshold')
+        plt.title(f'{ticker} Direction Prediction')
+        plt.ylim(-0.1, 1.1)
+        plt.legend()
+        plt.grid(True)
+        
+        # Threshold evolution
+        plt.subplot(3, 1, 3)
+        plt.plot(ticker_results['Date'], ticker_results['DirectionThreshold'], 'm-', linewidth=2)
+        plt.title(f'{ticker} Decision Threshold Evolution')
+        plt.ylabel('Threshold')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f'{ticker}_performance.png')
+        plt.close()
+    
+    # Save memory
+    def save_memory(memory, filename):
+        mem_data = {}
+        for ticker in tickers:
+            samples = memory.sample(ticker)
+            mem_data[ticker] = [{
+                'x': {k: float(v) if isinstance(v, float) else v for k, v in x.items()},
+                'y': float(y) if isinstance(y, float) else y
+            } for x, y in samples]
+        
+        with open(filename, 'w') as f:
+            json.dump(mem_data, f, indent=2)
+    
+    save_memory(memory_vol, 'volatility_memory.json')
+    save_memory(memory_dir, 'direction_memory.json')
+
+if __name__ == "__main__":
+    main()
