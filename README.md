@@ -45,3 +45,24 @@ Metric Tracking:
 Real-time tracking of performance using river.metrics
 
 Separate tracking for long-term and rolling window evaluation
+
+sample  results
+Confusion Matrix (Direction Prediction):
+[[ 21 611]
+ [ 22 752]]
+
+Final Metrics:
+vol_mae: 0.0009
+vol_rmse: 0.0018
+vol_r2: 0.9375
+dir_accuracy: 0.5498
+dir_precision: 0.5517
+dir_recall: 0.9716
+dir_f1: 0.7038
+dir_roc_auc: 0.5019
+dir_geometric_mean: 0.1797
+
+Rolling Metrics:
+vol_mae: 0.0005
+dir_accuracy: 0.6000
+dir_f1: 0.7500
