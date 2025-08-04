@@ -1,68 +1,232 @@
-# volatility-and-direction-prediction-using-online-learning
-This project explores the use of online machine learning models to predict both market volatility (as a regression task) and market direction (as a binary classification task) from financial time series data.
+# Online Trading Model with Concept Drift Handling
 
-Unlike traditional batch learning, which trains on large datasets all at once, online learning updates the model incrementally as new data arrives. This makes it ideal for real-time systems, streaming data, and environments where the data distribution may shift over time. The model does not need to be retrained from scratch and can adapt quickly to changing patterns in financial markets.
+## Overview
+This Python project implements an adaptive online learning system for financial trading that handles concept drift in market conditions. The system:
+1. Fetches real-time stock/ETF data
+2. Engineers technical features
+3. Trains two models simultaneously:
+   - Volatility prediction (linear regression)
+   - Price direction classification (adaptive random forest)
+4. Detects and adapts to concept drift
+5. Optimizes decision thresholds dynamically
+6. Visualizes performance metrics
 
-Key Features
-Dual-task prediction: Simultaneously models volatility (continuous target) and market direction (up or down).
+## Key Features
 
-Online learning architecture: Uses data streams to update models one sample at a time.
+### 1. Adaptive Learning System
+- **Volatility Prediction**: Linear regression model for forecasting market volatility
+- **Direction Classification**: Adaptive Random Forest classifier for price movement prediction
+- **Concept Drift Handling**: ADWIN detectors identify changing market conditions
+- **Experience Replay**: Episodic memory stores important market patterns
 
-Real-time adaptivity: Models are designed to handle drift and evolving distributions.
+### 2. Feature Engineering
+- **Technical Indicators**:
+  - RSI (Relative Strength Index)
+  - MACD (Moving Average Convergence Divergence)
+  - Bollinger Bands
+  - Volatility regimes
+  - Volume analysis
+- **Temporal Features**:
+  - Day of week, month, and day of month patterns
 
-Evaluation on both full dataset and rolling window to assess long-term and short-term performance.
+### 3. Dynamic Adaptation
+- **Threshold Optimization**: Automatically adjusts classification threshold based on F1 score
+- **Drift Response**: Triggers experience replay when concept drift is detected
+- **Rolling Metrics**: Tracks recent performance with 90-day rolling window
 
-Rich set of metrics: Includes accuracy, precision, recall, F1, ROC AUC, and geometric mean for classification, and MAE, RMSE, and R² for regression.
+## Installation
 
-Why Online Learning?
-Financial markets are dynamic. Patterns and regimes change rapidly. Models trained offline on static historical data often degrade in performance when exposed to new, unseen data. Online learning provides a solution by:
+```bash
+pip install -r requirements.txt
+```
 
-Continuously adapting to concept drift and volatility shifts
+**requirements.txt:**
+```
+yfinance
+pandas
+numpy
+river
+scikit-learn
+matplotlib
+```
 
-Requiring low memory and computational resources
+## Usage
 
-Enabling low-latency predictions for real-time systems
+### 1. Configure Assets
+Edit the `tickers` dictionary to add assets:
+```python
+tickers = {
+    'AAPL': 'stock',
+    'MSFT': 'stock',
+    'SPY': 'ETF',
+    'QQQ': 'ETF'
+}
+```
 
-Providing flexibility in environments with delayed or partial feedback
+### 2. Run the Model
+```bash
+python trading_model.py
+```
 
-Core Techniques and Tools
-Data Source: Financial time series from yfinance, including prices and derived indicators.
+### 3. Output Files
+- `enhanced_trading_model_results.csv`: Prediction results
+- `*_performance.png`: Visualization charts for each asset
+- `volatility_memory.json`: Stored volatility patterns
+- `direction_memory.json`: Stored price direction patterns
 
-Online Models:
+## Model Architecture
 
-River library for incremental learning algorithms
+```mermaid
+graph TD
+    A[Data Fetching] --> B[Feature Engineering]
+    B --> C[Data Preprocessing]
+    C --> D[Volatility Model]
+    C --> E[Direction Model]
+    D --> F[Drift Detection]
+    E --> F
+    F --> G[Experience Replay]
+    G --> D
+    G --> E
+    D --> H[Metrics Tracking]
+    E --> H
+    H --> I[Visualization]
+```
 
-ARFClassifier for direction prediction
+## Key Components
 
-LinearRegression with online optimizers for volatility estimation
+### 1. Data Pipeline
+```python
+# Data fetching with retries
+df = fetch_data(tickers, period='3y')
 
-Drift Detection:
+# Feature engineering
+df = engineer_features_and_targets(df)
 
-Integrated drift detectors for adjusting to distributional shifts
+# Preprocessing pipeline
+preproc = compose.TransformerUnion(
+    compose.SelectType((float,)) | preprocessing.StandardScaler(),
+    compose.SelectType((object,)) | OneHotEncoder()
+)
+```
 
-Metric Tracking:
+### 2. Machine Learning Models
+**Volatility Prediction:**
+```python
+vol_model = LinearRegression(
+    optimizer=SGD(0.005),
+    intercept_lr=0.05,
+    l2=0.01
+)
+```
 
-Real-time tracking of performance using river.metrics
+**Direction Classification:**
+```python
+dir_model = ARFClassifier(
+    n_models=15,
+    drift_detector=ADWIN(),
+    warning_detector=ADWIN(),
+    seed=42,
+    lambda_value=6  
+)
+```
 
-Separate tracking for long-term and rolling window evaluation
+### 3. Drift Adaptation System
+```python
+# Drift detectors
+vol_drift_detector = ADWIN()
+dir_drift_detector = ADWIN()
 
-sample  results
-Confusion Matrix (Direction Prediction):
-[[ 21 611]
- [ 22 752]]
+# Episodic memory
+memory_vol = EnhancedEpisodicMemory(replay_size=100)
+memory_dir = EnhancedEpisodicMemory(replay_size=100)
 
-Final Metrics:
-vol_mae: 0.0009
-vol_rmse: 0.0018
-vol_r2: 0.9375
-dir_accuracy: 0.5498
-dir_precision: 0.5517
-dir_recall: 0.9716
-dir_f1: 0.7038
-dir_roc_auc: 0.5019
-dir_geometric_mean: 0.1797
+# Threshold optimization
+threshold_optimizer = DirectionThresholdOptimizer()
+```
 
-Rolling Metrics:
-vol_mae: 0.0005
-dir_accuracy: 0.6000
-dir_f1: 0.7500
+### 4. Evaluation Metrics
+**Tracked Metrics:**
+```python
+metrics_dict = {
+    'vol_mae': metrics.MAE(),
+    'vol_rmse': metrics.RMSE(),
+    'vol_r2': metrics.R2(),
+    'dir_accuracy': metrics.Accuracy(),
+    'dir_precision': metrics.Precision(),
+    'dir_recall': metrics.Recall(),
+    'dir_f1': metrics.F1(),
+    'dir_roc_auc': metrics.ROCAUC(),
+    'dir_geometric_mean': metrics.GeometricMean()
+}
+```
+
+## Performance Visualization
+
+The system generates three types of visualizations for each asset:
+
+1. **Volatility Prediction**:
+   - True vs predicted volatility
+   - Shows model's ability to forecast market volatility
+
+2. **Direction Prediction**:
+   - True price direction (binary)
+   - Predicted probability of price increase
+   - Dynamic decision threshold
+
+3. **Threshold Evolution**:
+   - Shows how the classification threshold adapts over time
+   - Reflects changing market conditions
+
+![Example Visualization](AAPL_performance.png)
+
+## Configuration Options
+
+### Time Periods
+```python
+# In fetch_data()
+period='3y'  # 1y, 2y, 5y, etc.
+interval='1d'  # 1m, 5m, 15m, 1h, 1d
+```
+
+### Model Parameters
+```python
+# In ARFClassifier()
+n_models=15          # Number of trees in the forest
+lambda_value=6       # Lambda parameter for Poisson distribution
+
+# In DirectionThresholdOptimizer()
+window_size=200      # Sample window for threshold optimization
+step=0.05            # Threshold adjustment granularity
+```
+
+### Memory Settings
+```python
+# In EnhancedEpisodicMemory()
+max_size=2000        # Maximum stored samples per asset
+replay_size=100      # Samples to replay during adaptation
+```
+
+## Performance Metrics
+
+The system tracks both instantaneous and rolling metrics:
+
+| Metric | Description | Type |
+|--------|-------------|------|
+| vol_mae | Mean Absolute Error (volatility) | Instant & Rolling |
+| vol_rmse | Root Mean Squared Error (volatility) | Instant |
+| vol_r2 | R² Score (volatility) | Instant |
+| dir_accuracy | Classification accuracy | Instant |
+| dir_precision | Precision (direction) | Instant |
+| dir_recall | Recall (direction) | Instant |
+| dir_f1 | F1 Score (direction) | Instant & Rolling |
+| dir_roc_auc | ROC AUC (direction) | Instant |
+| dir_geometric_mean | Geometric mean | Instant |
+
+## References
+
+1. Montiel, J., et al. (2021). River: machine learning for streaming data in Python.
+2. Bifet, A., & Gavaldà, R. (2007). Learning from time-changing data with adaptive windowing.
+3. Oza, N. C., & Russell, S. J. (2001). Online bagging and boosting.
+4. Yahoo Finance (2023). Financial data API.
+
+
